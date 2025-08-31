@@ -1,0 +1,388 @@
+#!/usr/bin/env python3
+"""
+Fetch App Store keywords for one or more apps and locales using the
+App Store Connect API.
+
+- Accepts App Store IDs (e.g., id123456789 or 123456789), bundle IDs (e.g., com.example.app),
+  or App Store Connect App IDs (resource IDs).
+- For each requested locale (e.g., en-US), prints the app name and keywords.
+
+Note: App Store keywords are only accessible for apps you have access to in
+your App Store Connect account tied to the API key.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import datetime as dt
+import json
+import os
+import re
+import sys
+from typing import Dict, List, Optional, Tuple
+
+import jwt  # PyJWT
+import requests
+
+ASC_API_BASE = "https://api.appstoreconnect.apple.com/v1"
+ITUNES_LOOKUP_URL = "https://itunes.apple.com/lookup"
+
+
+class AppStoreConnectClient:
+    """Lightweight ASC API client with JWT auth (ES256)."""
+
+    def __init__(
+        self,
+        key_id: str,
+        issuer_id: str,
+        private_key_pem: str,
+        token_ttl_seconds: int = 1200,
+        http_timeout_seconds: int = 30,
+    ) -> None:
+        if not key_id or not issuer_id or not private_key_pem:
+            raise ValueError("Missing App Store Connect credentials")
+        self.key_id = key_id
+        self.issuer_id = issuer_id
+        self.private_key_pem = private_key_pem
+        self.token_ttl_seconds = min(max(token_ttl_seconds, 60), 1200)  # Apple max 20 min
+        self.http_timeout_seconds = http_timeout_seconds
+        self._cached_token: Optional[str] = None
+        self._cached_token_exp: Optional[int] = None
+
+    def _generate_token(self) -> str:
+        now = int(dt.datetime.utcnow().timestamp())
+        if self._cached_token and self._cached_token_exp and now + 30 < self._cached_token_exp:
+            return self._cached_token
+        headers = {"kid": self.key_id, "alg": "ES256", "typ": "JWT"}
+        payload = {
+            "iss": self.issuer_id,
+            "exp": now + self.token_ttl_seconds,
+            "aud": "appstoreconnect-v1",
+        }
+        token = jwt.encode(payload, self.private_key_pem, algorithm="ES256", headers=headers)
+        # PyJWT may return str or bytes depending on version
+        if isinstance(token, bytes):
+            token = token.decode("utf-8")
+        self._cached_token = token
+        self._cached_token_exp = payload["exp"]
+        return token
+
+    def _headers(self) -> Dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self._generate_token()}",
+            "Accept": "application/json",
+            "User-Agent": "aso-keywords-fetcher/1.0",
+        }
+
+    def get(self, path: str, params: Optional[Dict[str, str]] = None) -> Dict:
+        url = f"{ASC_API_BASE}{path}"
+        resp = requests.get(url, headers=self._headers(), params=params or {}, timeout=self.http_timeout_seconds)
+        self._raise_for_status_with_detail(resp)
+        return resp.json()
+
+    @staticmethod
+    def _raise_for_status_with_detail(resp: requests.Response) -> None:
+        try:
+            resp.raise_for_status()
+        except requests.HTTPError as e:
+            detail = ""
+            try:
+                data = resp.json()
+                if isinstance(data, dict) and data.get("errors"):
+                    detail = json.dumps(data.get("errors"), indent=2)
+                else:
+                    detail = json.dumps(data, indent=2)
+            except Exception:
+                detail = resp.text
+            raise requests.HTTPError(f"HTTP {resp.status_code} error: {detail}") from e
+
+    # --- App resolution ---
+    def get_app_by_bundle_id(self, bundle_id: str) -> Optional[Dict]:
+        data = self.get("/apps", params={"filter[bundleId]": bundle_id, "limit": "2"})
+        items = data.get("data", [])
+        return items[0] if items else None
+
+    def get_app_by_connect_id(self, connect_app_id: str) -> Optional[Dict]:
+        try:
+            data = self.get(f"/apps/{connect_app_id}")
+            return data.get("data")
+        except requests.HTTPError as e:
+            if "404" in str(e):
+                return None
+            raise
+
+    def list_app_store_versions(self, app_id: str, platform: str = "IOS", state: Optional[str] = None) -> List[Dict]:
+        params: Dict[str, str] = {"filter[platform]": platform, "limit": "200"}
+        if state:
+            params["filter[appStoreState]"] = state
+        data = self.get(f"/apps/{app_id}/appStoreVersions", params=params)
+        return data.get("data", [])
+
+    def get_app_info_id(self, app_id: str) -> Optional[str]:
+        data = self.get(f"/apps/{app_id}/appInfos", params={"limit": "1"})
+        items = data.get("data", [])
+        return items[0]["id"] if items else None
+
+    def get_app_name_for_locale(self, app_id: str, locale: str) -> Optional[str]:
+        app_info_id = self.get_app_info_id(app_id)
+        if not app_info_id:
+            return None
+        data = self.get(
+            f"/appInfos/{app_info_id}/appInfoLocalizations",
+            params={"filter[locale]": locale, "limit": "1"},
+        )
+        items = data.get("data", [])
+        if not items:
+            return None
+        return items[0].get("attributes", {}).get("name")
+
+    def get_keywords_for_version_locale(self, app_store_version_id: str, locale: str) -> Optional[str]:
+        data = self.get(
+            f"/appStoreVersions/{app_store_version_id}/appStoreVersionLocalizations",
+            params={"filter[locale]": locale, "limit": "1"},
+        )
+        items = data.get("data", [])
+        if not items:
+            return None
+        return items[0].get("attributes", {}).get("keywords")
+
+
+def is_bundle_id(value: str) -> bool:
+    return "." in value and not value.lower().startswith("id") and not value.isdigit()
+
+
+def normalize_itunes_id(value: str) -> Optional[str]:
+    m = re.fullmatch(r"id?(\d+)", value.strip())
+    return m.group(1) if m else None
+
+
+def itunes_lookup_by_id(itunes_id: str, country: str = "us", timeout_seconds: int = 15) -> Optional[Dict]:
+    try:
+        resp = requests.get(
+            ITUNES_LOOKUP_URL,
+            params={"id": itunes_id, "country": country},
+            timeout=timeout_seconds,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("resultCount", 0) > 0:
+            return data["results"][0]
+        return None
+    except Exception:
+        return None
+
+
+def resolve_app(
+    client: AppStoreConnectClient,
+    app_identifier: str,
+    country: str,
+) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """
+    Resolve an input identifier to (connect_app_id, bundle_id, itunes_id, display_name).
+    - Accepts: App Store numeric ID (with or without id prefix), bundle ID, or connect app id.
+    """
+    # If it's an iTunes App Store ID, look up bundle id and name via iTunes API
+    itunes_id = normalize_itunes_id(app_identifier)
+    if itunes_id:
+        itunes = itunes_lookup_by_id(itunes_id, country=country)
+        display_name = (itunes or {}).get("trackName")
+        bundle_id = (itunes or {}).get("bundleId")
+        connect_app_id = None
+        if bundle_id:
+            app = client.get_app_by_bundle_id(bundle_id)
+            connect_app_id = app["id"] if app else None
+        return connect_app_id, bundle_id, itunes_id, display_name
+
+    # If it looks like a bundle id, resolve to connect app id
+    if is_bundle_id(app_identifier):
+        app = client.get_app_by_bundle_id(app_identifier)
+        if app:
+            return app["id"], app.get("attributes", {}).get("bundleId"), None, None
+        return None, app_identifier, None, None
+
+    # Otherwise, assume it's a Connect app id
+    app = client.get_app_by_connect_id(app_identifier)
+    if app:
+        return app["id"], app.get("attributes", {}).get("bundleId"), None, None
+
+    return None, None, None, None
+
+
+def choose_app_store_version(
+    client: AppStoreConnectClient,
+    app_id: str,
+    platform: str,
+    prefer_live: bool = True,
+) -> Optional[Dict]:
+    """Pick an App Store Version. Prefer READY_FOR_SALE if available."""
+    versions: List[Dict] = []
+    if prefer_live:
+        versions = client.list_app_store_versions(app_id, platform=platform, state="READY_FOR_SALE")
+    if not versions:
+        versions = client.list_app_store_versions(app_id, platform=platform)
+    if not versions:
+        return None
+    # If multiple, pick most recent by createdDate if present; otherwise first.
+    def created_key(v: Dict) -> str:
+        return v.get("attributes", {}).get("createdDate", "")
+
+    versions_sorted = sorted(versions, key=created_key, reverse=True)
+    return versions_sorted[0]
+
+
+def load_private_key_from_args(args: argparse.Namespace) -> str:
+    # Priority: --key-file > ASC_PRIVATE_KEY_PATH env; then --key > ASC_PRIVATE_KEY env
+    if args.key_file:
+        with open(args.key_file, "r", encoding="utf-8") as f:
+            return f.read()
+    env_path = os.getenv("ASC_PRIVATE_KEY_PATH")
+    if env_path and os.path.exists(env_path):
+        with open(env_path, "r", encoding="utf-8") as f:
+            return f.read()
+    if args.key:
+        return args.key
+    env_key = os.getenv("ASC_PRIVATE_KEY")
+    if env_key:
+        # Support base64-encoded private key as a convenience
+        maybe_decoded: Optional[str] = None
+        try:
+            maybe_decoded = base64.b64decode(env_key).decode("utf-8")
+        except Exception:
+            maybe_decoded = None
+        return maybe_decoded or env_key
+    raise SystemExit("Missing private key: provide --key-file or --key, or set ASC_PRIVATE_KEY_PATH/ASC_PRIVATE_KEY")
+
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Fetch App Store keywords for apps and locales using App Store Connect API.",
+    )
+    parser.add_argument(
+        "apps",
+        nargs="+",
+        help="App identifiers: App Store IDs (id12345 or 12345), bundle IDs (com.example.app), or Connect App IDs",
+    )
+    parser.add_argument(
+        "-l",
+        "--locales",
+        nargs="+",
+        default=["en-US"],
+        help="Locales to fetch (e.g., en-US de-DE fr-FR). Default: en-US",
+    )
+    parser.add_argument(
+        "--platform",
+        choices=["IOS", "MAC_OS", "TV_OS"],
+        default="IOS",
+        help="Target platform for the App Store version. Default: IOS",
+    )
+    parser.add_argument(
+        "--country",
+        default=os.getenv("ASC_COUNTRY", "us"),
+        help="Country code for iTunes lookup when given App Store IDs. Default: us",
+    )
+    parser.add_argument(
+        "--prefer-live",
+        action="store_true",
+        help="Prefer the live (READY_FOR_SALE) App Store version when selecting keywords",
+    )
+    # Credentials
+    parser.add_argument("--key-id", default=os.getenv("ASC_KEY_ID"), help="App Store Connect API Key ID")
+    parser.add_argument("--issuer-id", default=os.getenv("ASC_ISSUER_ID"), help="App Store Connect API Issuer ID")
+    parser.add_argument("--key-file", help="Path to the App Store Connect API .p8 private key file")
+    parser.add_argument("--key", help="Private key contents (PEM). Alternatively set ASC_PRIVATE_KEY env var")
+    parser.add_argument(
+        "--token-ttl",
+        type=int,
+        default=int(os.getenv("ASC_TOKEN_TTL", "1200")),
+        help="JWT token lifetime in seconds (max 1200). Default: 1200",
+    )
+    parser.add_argument(
+        "--http-timeout",
+        type=int,
+        default=int(os.getenv("ASC_HTTP_TIMEOUT", "30")),
+        help="HTTP timeout in seconds. Default: 30",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = parse_args(argv)
+
+    if not args.key_id or not args.issuer_id:
+        print("Error: Missing credentials. Provide --key-id and --issuer-id or set ASC_KEY_ID/ASC_ISSUER_ID.", file=sys.stderr)
+        return 2
+
+    private_key_pem = load_private_key_from_args(args)
+
+    client = AppStoreConnectClient(
+        key_id=args.key_id,
+        issuer_id=args.issuer_id,
+        private_key_pem=private_key_pem,
+        token_ttl_seconds=args.token_ttl,
+        http_timeout_seconds=args.http_timeout,
+    )
+
+    any_errors = False
+
+    for app_input in args.apps:
+        try:
+            connect_app_id, bundle_id, itunes_id, display_name = resolve_app(client, app_input, country=args.country)
+        except requests.HTTPError as e:
+            print(f"Failed to resolve app '{app_input}': {e}", file=sys.stderr)
+            any_errors = True
+            continue
+
+        if not connect_app_id and not bundle_id and not itunes_id:
+            print(f"Could not find app for '{app_input}'. Ensure you own the app or provided a valid identifier.", file=sys.stderr)
+            any_errors = True
+            continue
+
+        # Select version
+        version = None
+        if connect_app_id:
+            try:
+                version = choose_app_store_version(client, connect_app_id, platform=args.platform, prefer_live=args.prefer_live)
+            except requests.HTTPError as e:
+                print(f"Failed to list versions for app '{app_input}': {e}", file=sys.stderr)
+                any_errors = True
+                continue
+        if not version:
+            print(f"No App Store versions found for '{app_input}'.", file=sys.stderr)
+            any_errors = True
+            continue
+        version_id = version["id"]
+
+        for locale in args.locales:
+            # Name resolution priority: ASC appInfo name (locale) -> iTunes trackName -> bundleId
+            name = None
+            if connect_app_id:
+                try:
+                    name = client.get_app_name_for_locale(connect_app_id, locale)
+                except requests.HTTPError:
+                    name = None
+            if not name:
+                name = display_name or bundle_id or "Unknown App"
+
+            # Keywords
+            keywords = None
+            try:
+                keywords = client.get_keywords_for_version_locale(version_id, locale)
+            except requests.HTTPError as e:
+                print(f"Failed to fetch keywords for '{app_input}' [{locale}]: {e}", file=sys.stderr)
+
+            # Output
+            printed_id = f"id{itunes_id}" if itunes_id else (bundle_id or connect_app_id or "?")
+            print(f"Name: {name} {printed_id} [{locale}]")
+            print("=" * 40)
+            if keywords and keywords.strip():
+                print(keywords.strip())
+            else:
+                print("(no keywords)")
+            # Separator between locales for readability
+            # print()
+
+    return 1 if any_errors else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
