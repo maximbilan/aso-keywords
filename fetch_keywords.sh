@@ -20,12 +20,13 @@ fi
 # shellcheck disable=SC1091
 source "$VENV_DIR/bin/activate"
 
-python -m pip install --upgrade pip >/dev/null
+python -m pip install --upgrade pip >/dev/null 2>&1
 if [ -f "$REQUIREMENTS_FILE" ]; then
-  pip install -r "$REQUIREMENTS_FILE"
+  # Hide noisy 'Requirement already satisfied' messages while keeping errors visible
+  pip install -q -r "$REQUIREMENTS_FILE" >/dev/null
 fi
 
-# Load .env if present (exports variables like ASC_KEY_ID, ASC_ISSUER_ID, etc.)
+# Load .env if present (exports variables like DEFAULT_COUNTRY, ASO_CHAR_LIMIT, etc.)
 if [ -f "$SCRIPT_DIR/.env" ]; then
   set -a
   # shellcheck disable=SC1091
@@ -36,7 +37,8 @@ fi
 if [ $# -eq 0 ]; then
   echo "Usage: $(basename "$0") [fetch_keywords.py options and arguments]" >&2
   echo "Examples:" >&2
-  echo "  ASC_KEY_ID=... ASC_ISSUER_ID=... ASC_PRIVATE_KEY_PATH=... $(basename "$0") id123456789 -l en-US" >&2
+  echo "  $(basename "$0") id123456789 -l en-US" >&2
+  echo "  $(basename "$0") com.example.myapp -l en-US de-DE" >&2
   echo "  $(basename "$0") -h  # show Python CLI help" >&2
 fi
 
