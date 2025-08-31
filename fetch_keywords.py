@@ -23,6 +23,11 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import jwt  # PyJWT
 import requests
+from cryptography.hazmat.primitives.serialization import (
+    load_pem_private_key,
+    load_der_private_key,
+)
+from cryptography.hazmat.backends import default_backend
 
 ASC_API_BASE = "https://api.appstoreconnect.apple.com/v1"
 ITUNES_LOOKUP_URL = "https://itunes.apple.com/lookup"
@@ -48,6 +53,42 @@ class AppStoreConnectClient:
         self.http_timeout_seconds = http_timeout_seconds
         self._cached_token: Optional[str] = None
         self._cached_token_exp: Optional[int] = None
+        self._signing_key = self._load_signing_key(private_key_pem)
+
+    @staticmethod
+    def _load_signing_key(key_data: Union[str, bytes]):
+        """Load an EC private key object suitable for ES256 signing.
+
+        Accepts PEM text, PEM bytes, or DER bytes. If given a str that looks base64-encoded,
+        attempts to base64-decode first.
+        """
+        if isinstance(key_data, str):
+            text = key_data.strip()
+            # Normalize escaped newlines
+            if "\\n" in text and "-----BEGIN" in text:
+                text = text.replace("\\n", "\n")
+            # Load PEM if it looks like PEM
+            if "-----BEGIN" in text and "-----END" in text:
+                try:
+                    return load_pem_private_key(text.encode("utf-8"), password=None, backend=default_backend())
+                except Exception:
+                    pass
+            # Try base64 → DER
+            try:
+                raw = base64.b64decode(text)
+            except Exception:
+                raw = text.encode("utf-8", errors="ignore")
+        else:
+            raw = key_data
+
+        # Try PEM then DER with raw bytes
+        try:
+            return load_pem_private_key(raw, password=None, backend=default_backend())
+        except Exception:
+            try:
+                return load_der_private_key(raw, password=None, backend=default_backend())
+            except Exception as e:
+                raise SystemExit(f"Failed to parse private key: {e}")
 
     def _generate_token(self) -> str:
         now = int(dt.datetime.utcnow().timestamp())
@@ -60,7 +101,7 @@ class AppStoreConnectClient:
             "exp": now + self.token_ttl_seconds,
             "aud": "appstoreconnect-v1",
         }
-        token = jwt.encode(payload, self.private_key_pem, algorithm="ES256", headers=headers)
+        token = jwt.encode(payload, self._signing_key, algorithm="ES256", headers=headers)
         # PyJWT may return str or bytes depending on version
         if isinstance(token, bytes):
             token = token.decode("utf-8")
