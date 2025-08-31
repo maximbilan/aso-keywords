@@ -1,4 +1,4 @@
-# aso-keywords
+# ASO keywords
 
 Fetch Apple App Store keywords for one or more apps and locales using ONLY public iTunes APIs (no App Store Connect required).
 
