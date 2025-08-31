@@ -235,10 +235,27 @@ def itunes_lookup_by_id(itunes_id: str, country: str = "us", timeout_seconds: in
         return None
 
 
+def itunes_lookup_by_bundle_id(bundle_id: str, country: str = "us", timeout_seconds: int = 15) -> Optional[Dict]:
+    try:
+        resp = requests.get(
+            ITUNES_LOOKUP_URL,
+            params={"bundleId": bundle_id, "country": country},
+            timeout=timeout_seconds,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("resultCount", 0) > 0:
+            return data["results"][0]
+        return None
+    except Exception:
+        return None
+
+
 def resolve_app(
     client: AppStoreConnectClient,
     app_identifier: str,
     country: str,
+    asc_mode: str,
 ) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[Dict]]:
     """
     Resolve an input identifier to (connect_app_id, bundle_id, itunes_id, display_name).
@@ -251,20 +268,43 @@ def resolve_app(
         display_name = (itunes or {}).get("trackName")
         bundle_id = (itunes or {}).get("bundleId")
         connect_app_id = None
-        if bundle_id:
-            app = client.get_app_by_bundle_id(bundle_id)
-            connect_app_id = app["id"] if app else None
+        if bundle_id and asc_mode != "off":
+            try:
+                app = client.get_app_by_bundle_id(bundle_id)
+                connect_app_id = app["id"] if app else None
+            except requests.HTTPError:
+                if asc_mode == "force":
+                    raise
+                connect_app_id = None
         return connect_app_id, bundle_id, itunes_id, display_name, itunes
 
     # If it looks like a bundle id, resolve to connect app id
     if is_bundle_id(app_identifier):
-        app = client.get_app_by_bundle_id(app_identifier)
-        if app:
-            return app["id"], app.get("attributes", {}).get("bundleId"), None, None, None
+        if asc_mode != "off":
+            try:
+                app = client.get_app_by_bundle_id(app_identifier)
+            except requests.HTTPError:
+                if asc_mode == "force":
+                    raise
+                app = None
+            if app:
+                return app["id"], app.get("attributes", {}).get("bundleId"), None, None, None
+        # Try iTunes by bundleId as fallback
+        itunes = itunes_lookup_by_bundle_id(app_identifier, country=country)
+        if itunes:
+            return None, itunes.get("bundleId"), str(itunes.get("trackId")) if itunes.get("trackId") else None, itunes.get("trackName"), itunes
         return None, app_identifier, None, None, None
 
     # Otherwise, assume it's a Connect app id
-    app = client.get_app_by_connect_id(app_identifier)
+    if asc_mode == "off":
+        # Cannot resolve Connect ID without ASC access
+        return None, None, None, None, None
+    try:
+        app = client.get_app_by_connect_id(app_identifier)
+    except requests.HTTPError:
+        if asc_mode == "force":
+            raise
+        app = None
     if app:
         return app["id"], app.get("attributes", {}).get("bundleId"), None, None, None
 
@@ -458,6 +498,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Prefer the live (READY_FOR_SALE) App Store version when selecting keywords",
     )
+    parser.add_argument(
+        "--asc",
+        choices=["auto", "force", "off"],
+        default=os.getenv("ASC_MODE", "auto"),
+        help="App Store Connect usage mode: auto (default), force (error on failure), off (never use ASC)",
+    )
     # Credentials
     parser.add_argument("--key-id", default=os.getenv("ASC_KEY_ID"), help="App Store Connect API Key ID")
     parser.add_argument("--issuer-id", default=os.getenv("ASC_ISSUER_ID"), help="App Store Connect API Issuer ID")
@@ -564,7 +610,12 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     for app_input in args.apps:
         try:
-            connect_app_id, bundle_id, itunes_id, display_name, itunes_item = resolve_app(client, app_input, country=args.country)
+            connect_app_id, bundle_id, itunes_id, display_name, itunes_item = resolve_app(
+                client,
+                app_input,
+                country=args.country,
+                asc_mode=args.asc,
+            )
         except requests.HTTPError as e:
             print(f"Failed to resolve app '{app_input}': {e}", file=sys.stderr)
             any_errors = True
@@ -578,7 +629,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         # Select version if we have Connect app access; otherwise fall back to iTunes heuristic
         version = None
         version_id = None
-        if connect_app_id:
+        if connect_app_id and args.asc != "off":
             try:
                 version = choose_app_store_version(client, connect_app_id, platform=args.platform, prefer_live=args.prefer_live)
                 if version:
