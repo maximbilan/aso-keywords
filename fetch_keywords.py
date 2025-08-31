@@ -32,6 +32,25 @@ from cryptography.hazmat.backends import default_backend
 ASC_API_BASE = "https://api.appstoreconnect.apple.com/v1"
 ITUNES_LOOKUP_URL = "https://itunes.apple.com/lookup"
 
+# Locale → iTunes storefront country mapping (subset; falls back to args.country)
+LOCALE_TO_COUNTRY: Dict[str, str] = {
+    "en": "us",
+    "en-US": "us",
+    "es": "es",
+    "es-MX": "mx",
+    "pt-PT": "pt",
+    "pt-BR": "br",
+    "fr": "fr",
+    "de": "de",
+    "it": "it",
+    "tr": "tr",
+    "hi": "in",
+    "ja": "jp",
+    "ko": "kr",
+    "ar": "sa",
+    "zh-Hans": "cn",
+}
+
 
 class AppStoreConnectClient:
     """Lightweight ASC API client with JWT auth (ES256)."""
@@ -220,7 +239,7 @@ def resolve_app(
     client: AppStoreConnectClient,
     app_identifier: str,
     country: str,
-) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[Dict]]:
     """
     Resolve an input identifier to (connect_app_id, bundle_id, itunes_id, display_name).
     - Accepts: App Store numeric ID (with or without id prefix), bundle ID, or connect app id.
@@ -235,21 +254,96 @@ def resolve_app(
         if bundle_id:
             app = client.get_app_by_bundle_id(bundle_id)
             connect_app_id = app["id"] if app else None
-        return connect_app_id, bundle_id, itunes_id, display_name
+        return connect_app_id, bundle_id, itunes_id, display_name, itunes
 
     # If it looks like a bundle id, resolve to connect app id
     if is_bundle_id(app_identifier):
         app = client.get_app_by_bundle_id(app_identifier)
         if app:
-            return app["id"], app.get("attributes", {}).get("bundleId"), None, None
-        return None, app_identifier, None, None
+            return app["id"], app.get("attributes", {}).get("bundleId"), None, None, None
+        return None, app_identifier, None, None, None
 
     # Otherwise, assume it's a Connect app id
     app = client.get_app_by_connect_id(app_identifier)
     if app:
-        return app["id"], app.get("attributes", {}).get("bundleId"), None, None
+        return app["id"], app.get("attributes", {}).get("bundleId"), None, None, None
 
-    return None, None, None, None
+    return None, None, None, None, None
+
+
+SIMPLE_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9\-']+")
+
+
+def map_locale_to_country(locale: str, default_country: str) -> str:
+    if not locale:
+        return default_country
+    if locale in LOCALE_TO_COUNTRY:
+        return LOCALE_TO_COUNTRY[locale]
+    base = locale.split("-")[0]
+    return LOCALE_TO_COUNTRY.get(base, default_country)
+
+
+def _extract_terms_from_itunes(locale: str, itunes_item: Dict) -> List[str]:
+    terms: List[str] = []
+    if not itunes_item:
+        return terms
+    title = (itunes_item.get("trackName") or "").lower()
+    desc = (itunes_item.get("description") or "").lower()
+    genres = [str(g).lower() for g in (itunes_item.get("genres") or [])]
+    # Title tokens weighted higher
+    terms.extend(SIMPLE_TOKEN_RE.findall(title))
+    # Description tokens
+    terms.extend(SIMPLE_TOKEN_RE.findall(desc))
+    # Genres
+    for g in genres:
+        terms.extend(SIMPLE_TOKEN_RE.findall(g))
+    # Basic filtering
+    out: List[str] = []
+    seen = set()
+    for t in terms:
+        if t.isdigit():
+            continue
+        if len(t) <= 1 and t not in {"ai"}:
+            continue
+        if t in {"app", "apps", "application", "applications", "iphone", "ipad", "ios", "free", "best", "new", "pro", "lite", "hd"}:
+            continue
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
+def build_keywords_from_itunes(locale: str, country: str, itunes_id: str) -> Optional[str]:
+    item = itunes_lookup_by_id(itunes_id, country=country)
+    if not item:
+        return None
+    tokens = _extract_terms_from_itunes(locale, item)
+    # Heuristic: prioritize tokens that appear in title, then genres, then description by frequency
+    title = (item.get("trackName") or "").lower()
+    genres = [str(g).lower() for g in (item.get("genres") or [])]
+    token_scores: Dict[str, int] = {}
+    for tok in tokens:
+        score = 1
+        if tok in title:
+            score += 4
+        if any(tok in g for g in genres):
+            score += 2
+        token_scores[tok] = token_scores.get(tok, 0) + score
+    # Sort by score desc then by token
+    sorted_terms = sorted(token_scores.items(), key=lambda kv: (-kv[1], kv[0]))
+    # Compose <= 100 chars comma-delimited
+    out_parts: List[str] = []
+    cur_len = 0
+    for term, _ in sorted_terms:
+        candidate = term.replace(" ", ",")
+        add_len = len(candidate) + (1 if out_parts else 0)
+        if cur_len + add_len > 100:
+            continue
+        out_parts.append(candidate)
+        cur_len += add_len
+        if cur_len >= 100:
+            break
+    return ",".join(out_parts) if out_parts else None
 
 
 def choose_app_store_version(
@@ -470,7 +564,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     for app_input in args.apps:
         try:
-            connect_app_id, bundle_id, itunes_id, display_name = resolve_app(client, app_input, country=args.country)
+            connect_app_id, bundle_id, itunes_id, display_name, itunes_item = resolve_app(client, app_input, country=args.country)
         except requests.HTTPError as e:
             print(f"Failed to resolve app '{app_input}': {e}", file=sys.stderr)
             any_errors = True
@@ -481,20 +575,17 @@ def main(argv: Optional[List[str]] = None) -> int:
             any_errors = True
             continue
 
-        # Select version
+        # Select version if we have Connect app access; otherwise fall back to iTunes heuristic
         version = None
+        version_id = None
         if connect_app_id:
             try:
                 version = choose_app_store_version(client, connect_app_id, platform=args.platform, prefer_live=args.prefer_live)
+                if version:
+                    version_id = version["id"]
             except requests.HTTPError as e:
                 print(f"Failed to list versions for app '{app_input}': {e}", file=sys.stderr)
-                any_errors = True
-                continue
-        if not version:
-            print(f"No App Store versions found for '{app_input}'.", file=sys.stderr)
-            any_errors = True
-            continue
-        version_id = version["id"]
+                version = None
 
         for locale in args.locales:
             # Name resolution priority: ASC appInfo name (locale) -> iTunes trackName -> bundleId
@@ -507,12 +598,17 @@ def main(argv: Optional[List[str]] = None) -> int:
             if not name:
                 name = display_name or bundle_id or "Unknown App"
 
-            # Keywords
+            # Keywords: use ASC if version available; else heuristic from iTunes metadata
             keywords = None
-            try:
-                keywords = client.get_keywords_for_version_locale(version_id, locale)
-            except requests.HTTPError as e:
-                print(f"Failed to fetch keywords for '{app_input}' [{locale}]: {e}", file=sys.stderr)
+            if version_id:
+                try:
+                    keywords = client.get_keywords_for_version_locale(version_id, locale)
+                except requests.HTTPError as e:
+                    print(f"Failed to fetch keywords for '{app_input}' [{locale}]: {e}", file=sys.stderr)
+            if not keywords and itunes_id:
+                # Map locale to country for better lookup context
+                country_for_locale = map_locale_to_country(locale, args.country)
+                keywords = build_keywords_from_itunes(locale, country_for_locale, itunes_id) or keywords
 
             # Output
             printed_id = f"id{itunes_id}" if itunes_id else (bundle_id or connect_app_id or "?")
