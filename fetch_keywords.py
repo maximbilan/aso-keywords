@@ -41,8 +41,8 @@ class AppStoreConnectClient:
     ) -> None:
         if not key_id or not issuer_id or not private_key_pem:
             raise ValueError("Missing App Store Connect credentials")
-        self.key_id = key_id
-        self.issuer_id = issuer_id
+        self.key_id = key_id.strip()
+        self.issuer_id = issuer_id.strip()
         self.private_key_pem = private_key_pem
         self.token_ttl_seconds = min(max(token_ttl_seconds, 60), 1200)  # Apple max 20 min
         self.http_timeout_seconds = http_timeout_seconds
@@ -56,6 +56,7 @@ class AppStoreConnectClient:
         headers = {"kid": self.key_id, "alg": "ES256", "typ": "JWT"}
         payload = {
             "iss": self.issuer_id,
+            "iat": now,
             "exp": now + self.token_ttl_seconds,
             "aud": "appstoreconnect-v1",
         }
@@ -71,11 +72,13 @@ class AppStoreConnectClient:
         return {
             "Authorization": f"Bearer {self._generate_token()}",
             "Accept": "application/json",
+            "Content-Type": "application/json",
             "User-Agent": "aso-keywords-fetcher/1.0",
         }
 
     def get(self, path: str, params: Optional[Dict[str, str]] = None) -> Dict:
         url = f"{ASC_API_BASE}{path}"
+        # Some proxies strip Authorization on GET with params, so avoid mixing if debug suggests issues
         resp = requests.get(url, headers=self._headers(), params=params or {}, timeout=self.http_timeout_seconds)
         self._raise_for_status_with_detail(resp)
         return resp.json()
