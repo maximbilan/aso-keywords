@@ -9,12 +9,14 @@ This script prints the app name and a heuristically constructed comma‑separate
   
 Note: Since this uses public metadata (title, genres, description), the resulting keywords are a best‑effort heuristic, not the private App Store Connect keywords field.
 
-Example output:
+Example output (colors in terminal, simplified here):
 
 ```
-Name: My Great App id123456789 [en-US]
-========================================
-garageband,ringtone maker,garage,ringtones,garage rigtones,garage band,ringtone,zedge
++--------------------------------------------------------------+
+| Name: My Great App id123456789 [en-US]                       |
+| garageband, ringtone maker, garage, ringtones, garage band,  |
+| ringtone, zedge                                              |
++--------------------------------------------------------------+
 ```
 
 ## Requirements
@@ -40,6 +42,14 @@ Show help:
 
 ```bash
 python3 fetch_keywords.py -h
+```
+
+Run via the helper script:
+
+```bash
+./fetch_keywords.sh id123456789 -l en-US
+./fetch_keywords.sh com.example.myapp -l en-US de-DE
+./fetch_keywords.sh --no-color id123456789 -l en-US
 ```
 
 Basic:
