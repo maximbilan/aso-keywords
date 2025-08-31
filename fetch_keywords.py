@@ -260,23 +260,23 @@ def _render_output(
 
     # Build colored header
     header = Text()
-    header.append("Name: ", style="bold white")
-    header.append(name, style="bold cyan")
+    header.append("Name: ", style="bold")
+    header.append(name, style="bold white")
     header.append(" ")
-    header.append(printed_id, style="magenta")
+    header.append(printed_id, style="bold cyan")
     header.append(" ")
-    header.append(f"[{locale}]", style="green")
+    header.append(f"[{locale}]", style="bold green")
 
     # Build keywords text
     if keywords and keywords.strip():
         kw_text = Text()
         terms = [t for t in keywords.strip().split(",") if t]
-        # Alternate styles for readability
-        styles = ["yellow", "bright_cyan", "bright_magenta", "bright_green", "bright_blue", "bright_yellow"]
+        # High-contrast alternating styles for readability
+        styles = ["bold white", "bold cyan"]
         for idx, term in enumerate(terms):
             style = styles[idx % len(styles)]
             if idx > 0:
-                kw_text.append(",", style="dim")
+                kw_text.append(", ", style="dim")
             kw_text.append(term, style=style)
     else:
         kw_text = Text("(no keywords)", style="dim")
@@ -285,8 +285,8 @@ def _render_output(
         kw_text,
         title=header,
         title_align="left",
-        border_style="blue",
-        box=box.ROUNDED if box else None,
+        border_style="bright_cyan",
+        box=box.SQUARE if box else None,
         padding=(1, 2),
     )
     console.print(panel)
