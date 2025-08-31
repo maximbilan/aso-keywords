@@ -258,26 +258,25 @@ def _render_output(
         print((keywords or "(no keywords)").strip() or "(no keywords)")
         return
 
-    # Build colored header
+    # Build colored header (consistent palette)
     header = Text()
-    header.append("Name: ", style="bold")
-    header.append(name, style="bold white")
+    header.append("Name: ", style="bold dim")
+    header.append(name, style="bold bright_white")
     header.append(" ")
-    header.append(printed_id, style="bold cyan")
+    header.append(printed_id, style="bold bright_cyan")
     header.append(" ")
-    header.append(f"[{locale}]", style="bold green")
+    header.append(f"[{locale}]", style="bold bright_green")
 
     # Build keywords text
     if keywords and keywords.strip():
         kw_text = Text()
         terms = [t for t in keywords.strip().split(",") if t]
-        # High-contrast alternating styles for readability
-        styles = ["bold white", "bold cyan"]
+        # Single, readable color for all keywords
+        term_style = "bold bright_yellow"
         for idx, term in enumerate(terms):
-            style = styles[idx % len(styles)]
             if idx > 0:
                 kw_text.append(", ", style="dim")
-            kw_text.append(term, style=style)
+            kw_text.append(term, style=term_style)
     else:
         kw_text = Text("(no keywords)", style="dim")
 
@@ -285,11 +284,12 @@ def _render_output(
         kw_text,
         title=header,
         title_align="left",
-        border_style="bright_cyan",
+        border_style="bright_blue",
         box=box.SQUARE if box else None,
         padding=(1, 2),
     )
     console.print(panel)
+    console.print()  # spacing between apps/locales
 
 
 def main(argv: Optional[List[str]] = None) -> int:
