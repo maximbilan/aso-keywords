@@ -294,7 +294,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "apps",
-        nargs="+",
+        nargs="*",
         help="App identifiers: App Store IDs (id12345 or 12345), bundle IDs (com.example.app), or Connect App IDs",
     )
     parser.add_argument(
@@ -326,6 +326,21 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--key-file", help="Path to the App Store Connect API .p8 private key file")
     parser.add_argument("--key", help="Private key contents (PEM). Alternatively set ASC_PRIVATE_KEY env var")
     parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging (also set ASC_DEBUG=1)",
+    )
+    parser.add_argument(
+        "--print-token",
+        action="store_true",
+        help="Print a freshly generated JWT and exit (for troubleshooting)",
+    )
+    parser.add_argument(
+        "--auth-check",
+        action="store_true",
+        help="Perform a simple authenticated request and report status, then exit",
+    )
+    parser.add_argument(
         "--token-ttl",
         type=int,
         default=int(os.getenv("ASC_TOKEN_TTL", "1200")),
@@ -343,6 +358,15 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
 
+    # Allow ASC_DEBUG env to enable debug mode
+    if not getattr(args, "debug", False):
+        env_debug = os.getenv("ASC_DEBUG", "").lower()
+        args.debug = env_debug in {"1", "true", "yes", "on"}
+
+    # Trim credentials to avoid whitespace issues
+    args.key_id = (args.key_id or "").strip()
+    args.issuer_id = (args.issuer_id or "").strip()
+
     if not args.key_id or not args.issuer_id:
         print("Error: Missing credentials. Provide --key-id and --issuer-id or set ASC_KEY_ID/ASC_ISSUER_ID.", file=sys.stderr)
         return 2
@@ -356,6 +380,47 @@ def main(argv: Optional[List[str]] = None) -> int:
         token_ttl_seconds=args.token_ttl,
         http_timeout_seconds=args.http_timeout,
     )
+
+    # If debug, print token meta (without private key) and clock details
+    if args.debug:
+        try:
+            token = client._generate_token()
+            header = jwt.get_unverified_header(token)
+            payload = jwt.decode(token, options={"verify_signature": False})
+            now = int(dt.datetime.utcnow().timestamp())
+            skew = payload.get("exp", 0) - now
+            print(
+                json.dumps(
+                    {
+                        "tokenHeader": header,
+                        "tokenPayload": payload,
+                        "nowUtc": now,
+                        "secondsUntilExp": skew,
+                    },
+                    indent=2,
+                )
+            )
+        except Exception as e:
+            print(f"Debug: failed to inspect token: {e}", file=sys.stderr)
+
+    # Utility modes
+    if args.print_token:
+        print(client._generate_token())
+        return 0
+
+    if args.auth_check:
+        try:
+            # Minimal authenticated request; doesn't require admin privileges
+            _ = client.get("/apps", params={"limit": "1"})
+            print("Auth OK: able to call App Store Connect API")
+            return 0
+        except requests.HTTPError as e:
+            print(f"Auth FAILED: {e}", file=sys.stderr)
+            return 1
+
+    if not args.apps:
+        print("Error: no apps provided. Pass one or more identifiers, or use --auth-check/--print-token.", file=sys.stderr)
+        return 2
 
     any_errors = False
 
