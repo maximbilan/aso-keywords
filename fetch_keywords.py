@@ -19,7 +19,7 @@ import json
 import os
 import re
 import sys
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import jwt  # PyJWT
 import requests
@@ -35,7 +35,7 @@ class AppStoreConnectClient:
         self,
         key_id: str,
         issuer_id: str,
-        private_key_pem: str,
+        private_key_pem: Union[str, bytes],
         token_ttl_seconds: int = 1200,
         http_timeout_seconds: int = 30,
     ) -> None:
@@ -230,26 +230,61 @@ def choose_app_store_version(
     return versions_sorted[0]
 
 
-def load_private_key_from_args(args: argparse.Namespace) -> str:
+def _coerce_pem(value: Union[str, bytes]) -> Union[str, bytes]:
+    """Attempt to coerce various input encodings to a usable PEM/DER key.
+
+    Handles:
+    - Raw PEM string
+    - PEM string with literal \n sequences
+    - Base64-encoded PEM (text)
+    - Base64-encoded DER (binary)
+    """
+    if isinstance(value, bytes):
+        # Could already be DER or PEM bytes
+        return value
+
+    text = value.strip()
+
+    # Replace literal \n with real newlines if present
+    if "\\n" in text and "-----BEGIN" in text:
+        text = text.replace("\\n", "\n")
+
+    # If it already looks like PEM, return as-is
+    if "-----BEGIN" in text and "-----END" in text:
+        return text
+
+    # Try Base64 decode → UTF-8 text PEM
+    try:
+        decoded_bytes = base64.b64decode(text)
+        try:
+            decoded_text = decoded_bytes.decode("utf-8")
+            if "-----BEGIN" in decoded_text:
+                return decoded_text
+        except UnicodeDecodeError:
+            # Not UTF-8 text; could be DER bytes
+            if decoded_bytes:
+                return decoded_bytes
+    except Exception:
+        pass
+
+    # As a last resort, return the original text
+    return text
+
+
+def load_private_key_from_args(args: argparse.Namespace) -> Union[str, bytes]:
     # Priority: --key-file > ASC_PRIVATE_KEY_PATH env; then --key > ASC_PRIVATE_KEY env
     if args.key_file:
         with open(args.key_file, "r", encoding="utf-8") as f:
-            return f.read()
+            return _coerce_pem(f.read())
     env_path = os.getenv("ASC_PRIVATE_KEY_PATH")
     if env_path and os.path.exists(env_path):
         with open(env_path, "r", encoding="utf-8") as f:
-            return f.read()
+            return _coerce_pem(f.read())
     if args.key:
-        return args.key
+        return _coerce_pem(args.key)
     env_key = os.getenv("ASC_PRIVATE_KEY")
     if env_key:
-        # Support base64-encoded private key as a convenience
-        maybe_decoded: Optional[str] = None
-        try:
-            maybe_decoded = base64.b64decode(env_key).decode("utf-8")
-        except Exception:
-            maybe_decoded = None
-        return maybe_decoded or env_key
+        return _coerce_pem(env_key)
     raise SystemExit("Missing private key: provide --key-file or --key, or set ASC_PRIVATE_KEY_PATH/ASC_PRIVATE_KEY")
 
 
