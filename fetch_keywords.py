@@ -28,6 +28,20 @@ from typing import Dict, List, Optional, Tuple
 
 import requests
 
+# Rich (for colorful output). Fallback to plain prints if unavailable.
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.text import Text
+    from rich import box
+    _RICH_AVAILABLE = True
+except Exception:  # pragma: no cover
+    Console = None  # type: ignore
+    Panel = None  # type: ignore
+    Text = None  # type: ignore
+    box = None  # type: ignore
+    _RICH_AVAILABLE = False
+
 ITUNES_LOOKUP_URL = "https://itunes.apple.com/lookup"
 
 # Locale → iTunes storefront country mapping (subset; falls back to --country)
@@ -213,11 +227,76 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=int(os.getenv("ASO_CHAR_LIMIT", "100")),
         help="Max characters for the keywords string (default: 100)",
     )
+    parser.add_argument(
+        "--no-color",
+        action="store_true",
+        help="Disable colored/pretty output",
+    )
     return parser.parse_args(argv)
+
+
+def _should_use_color(no_color_flag: bool) -> bool:
+    if no_color_flag:
+        return False
+    if os.getenv("NO_COLOR"):
+        return False
+    return sys.stdout.isatty() and _RICH_AVAILABLE
+
+
+def _render_output(
+    console: Optional[Console],
+    use_color: bool,
+    name: str,
+    printed_id: str,
+    locale: str,
+    keywords: Optional[str],
+) -> None:
+    if not use_color or console is None or not _RICH_AVAILABLE:
+        # Plain fallback
+        print(f"Name: {name} {printed_id} [{locale}]")
+        print("=" * 40)
+        print((keywords or "(no keywords)").strip() or "(no keywords)")
+        return
+
+    # Build colored header
+    header = Text()
+    header.append("Name: ", style="bold white")
+    header.append(name, style="bold cyan")
+    header.append(" ")
+    header.append(printed_id, style="magenta")
+    header.append(" ")
+    header.append(f"[{locale}]", style="green")
+
+    # Build keywords text
+    if keywords and keywords.strip():
+        kw_text = Text()
+        terms = [t for t in keywords.strip().split(",") if t]
+        # Alternate styles for readability
+        styles = ["yellow", "bright_cyan", "bright_magenta", "bright_green", "bright_blue", "bright_yellow"]
+        for idx, term in enumerate(terms):
+            style = styles[idx % len(styles)]
+            if idx > 0:
+                kw_text.append(",", style="dim")
+            kw_text.append(term, style=style)
+    else:
+        kw_text = Text("(no keywords)", style="dim")
+
+    panel = Panel(
+        kw_text,
+        title=header,
+        title_align="left",
+        border_style="blue",
+        box=box.ROUNDED if box else None,
+        padding=(1, 2),
+    )
+    console.print(panel)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
+
+    use_color = _should_use_color(args.no_color)
+    console: Optional[Console] = Console() if use_color and _RICH_AVAILABLE else None
 
     any_errors = False
 
@@ -243,12 +322,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             name = (item or {}).get("trackName") or "Unknown App"
             keywords = build_keywords_from_itunes(item, char_limit=args.char_limit) if item else None
 
-            print(f"Name: {name} {printed_id} [{locale}]")
-            print("=" * 40)
-            if keywords and keywords.strip():
-                print(keywords.strip())
-            else:
-                print("(no keywords)")
+            _render_output(console, use_color, name, printed_id, locale, keywords)
 
             if not item:
                 any_errors = True

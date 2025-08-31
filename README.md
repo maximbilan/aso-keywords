@@ -72,7 +72,7 @@ python3 fetch_keywords.py id123456789 -l en-US --country de
 
 ### Output format
 
-For each requested locale, the script prints:
+For each requested locale, the script prints a colored panel (when supported) or plain text:
 
 ```
 Name: <App Name> <identifier> [<locale>]
